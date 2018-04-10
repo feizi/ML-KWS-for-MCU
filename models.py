@@ -63,6 +63,7 @@ def prepare_model_settings(label_count, sample_rate, clip_duration_ms,
   else:
     spectrogram_length = 1 + int(length_minus_window / window_stride_samples)
   fingerprint_size = dct_coefficient_count * spectrogram_length
+  print(fingerprint_size, dct_coefficient_count, spectrogram_length)
   return {
       'desired_samples': desired_samples,
       'window_size_samples': window_size_samples,
@@ -73,6 +74,33 @@ def prepare_model_settings(label_count, sample_rate, clip_duration_ms,
       'label_count': label_count,
       'sample_rate': sample_rate,
   }
+
+def batch_norm_wrapper(inputs, n_hidden ,is_training, decay = 0.99, name=None):
+
+    if name is None:
+        scale = tf.get_variable('scale', shape=[n_hidden], initializer=tf.constant_initializer(1))
+        beta = tf.get_variable('beta', shape=[n_hidden], initializer=tf.constant_initializer(0))
+        pop_mean = tf.Variable(tf.zeros([n_hidden]), trainable=False, name="pop_mean")
+        pop_var = tf.Variable(tf.ones([n_hidden]), trainable=False, name="pop_var")
+    else:
+        scale = tf.get_variable(name+'scale', shape=[n_hidden], initializer=tf.constant_initializer(1))
+        beta = tf.get_variable(name+'beta', shape=[n_hidden], initializer=tf.constant_initializer(0))
+        pop_mean = tf.Variable(tf.zeros([n_hidden]), trainable=False, name=name+"pop_mean")
+        pop_var = tf.Variable(tf.ones([n_hidden]), trainable=False, name=name+"pop_var")
+
+
+    if is_training:
+        batch_mean, batch_var = tf.nn.moments(inputs,[0])
+        train_mean = tf.assign(pop_mean,
+                               pop_mean * decay + batch_mean * (1 - decay))
+        train_var = tf.assign(pop_var,
+                              pop_var * decay + batch_var * (1 - decay))
+        with tf.control_dependencies([train_mean, train_var]):
+            return tf.nn.batch_normalization(inputs,
+                batch_mean, batch_var, beta, scale, 0.001)
+    else:
+        return tf.nn.batch_normalization(inputs,
+               pop_mean, pop_var, beta, scale, 0.001)
 
 
 def create_model(fingerprint_input, model_settings, model_architecture,
@@ -616,6 +644,7 @@ def create_dnn_model(fingerprint_input, model_settings, model_size_info,
   label_count = model_settings['label_count']
   num_layers = len(model_size_info)
   layer_dim = [fingerprint_size]
+  print('input:',layer_dim,'layers:', num_layers)
   layer_dim.extend(model_size_info)
   flow = fingerprint_input
   tf.summary.histogram('input', flow)
@@ -624,16 +653,20 @@ def create_dnn_model(fingerprint_input, model_settings, model_size_info,
           W = tf.get_variable('W', shape=[layer_dim[i-1], layer_dim[i]], 
                 initializer=tf.contrib.layers.xavier_initializer())
           tf.summary.histogram('fc_'+str(i)+'_w', W)
-          b = tf.get_variable('b', shape=[layer_dim[i]])
-          tf.summary.histogram('fc_'+str(i)+'_b', b)
-          flow = tf.matmul(flow, W) + b
+          if i == 1:
+              flow = tf.matmul(flow, W)
+              flow = batch_norm_wrapper(flow, layer_dim[i], is_training)
+          else:
+              b = tf.get_variable('b', shape=[layer_dim[i]])
+              tf.summary.histogram('fc_'+str(i)+'_b', b)
+              flow = tf.matmul(flow, W) + b
           flow = tf.nn.relu(flow)
           if is_training:
             flow = tf.nn.dropout(flow, dropout_prob)
 
-  weights = tf.get_variable('final_fc', shape=[layer_dim[-1], label_count], 
+  weights = tf.get_variable('fc4W', shape=[layer_dim[-1], label_count], 
               initializer=tf.contrib.layers.xavier_initializer())
-  bias = tf.Variable(tf.zeros([label_count]))
+  bias = tf.get_variable('fc4b', shape=[label_count])
   logits = tf.matmul(flow, weights) + bias
   if is_training:
     return logits, dropout_prob
@@ -778,6 +811,9 @@ def create_basic_lstm_model(fingerprint_input, model_settings, model_size_info,
     with tf.variable_scope("lstm"): 
       lstmcell = tf.contrib.rnn.BasicLSTMCell(LSTM_units, forget_bias=1.0, 
                    state_is_tuple=True)
+      lstmcell = tf.contrib.rnn.DropoutWrapper(lstmcell,
+                                              input_keep_prob=1.0,
+                                              output_keep_prob=dropout_prob)
       _, last = tf.nn.dynamic_rnn(cell=lstmcell, inputs=fingerprint_4d, 
                   dtype=tf.float32)
       flow = last[-1]
