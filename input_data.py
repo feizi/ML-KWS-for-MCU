@@ -33,17 +33,22 @@ from six.moves import xrange  # pylint: disable=redefined-builtin
 import tensorflow as tf
 
 from tensorflow.contrib.framework.python.ops import audio_ops as contrib_audio
+import tensorflow.contrib.signal as signal
 from tensorflow.python.ops import io_ops
 from tensorflow.python.platform import gfile
 from tensorflow.python.util import compat
+from python_speech_features import mfcc as mfcc_py
+sys.path.append('./python_speech_features/python_speech_features/')
+from base import mfcc_HTK
 
 MAX_NUM_WAVS_PER_CLASS = 2**27 - 1  # ~134M
 SILENCE_LABEL = '_silence_'
 SILENCE_INDEX = 0
 UNKNOWN_WORD_LABEL = '_unknown_'
-UNKNOWN_WORD_INDEX = 1
+UNKNOWN_WORD_INDEX = 0
 BACKGROUND_NOISE_DIR_NAME = '_background_noise_'
 RANDOM_SEED = 59185
+DET_SILENCE = False
 
 
 def prepare_words_list(wanted_words):
@@ -55,7 +60,13 @@ def prepare_words_list(wanted_words):
   Returns:
     List with the standard silence and unknown tokens added.
   """
-  return [SILENCE_LABEL, UNKNOWN_WORD_LABEL] + wanted_words
+  global UNKNOWN_WORD_INDEX
+  if DET_SILENCE:
+      UNKNOWN_WORD_INDEX = 1
+      return [SILENCE_LABEL, UNKNOWN_WORD_LABEL] + wanted_words
+  else:
+      return [UNKNOWN_WORD_LABEL] + wanted_words
+
 
 
 def which_set(filename, validation_percentage, testing_percentage):
@@ -161,6 +172,8 @@ class AudioProcessor(object):
                             testing_percentage)
     self.prepare_background_data()
     self.prepare_processing_graph(model_settings)
+    self.wanted_words = wanted_words
+    self.unknown_percentage = unknown_percentage
 
   def maybe_download_and_extract_dataset(self, data_url, dest_directory):
     """Download and extract data set tar file.
@@ -233,12 +246,17 @@ class AudioProcessor(object):
     random.seed(RANDOM_SEED)
     wanted_words_index = {}
     for index, wanted_word in enumerate(wanted_words):
-      wanted_words_index[wanted_word] = index + 2
+        if DET_SILENCE :
+            wanted_words_index[wanted_word] = index + 2
+        else:
+            wanted_words_index[wanted_word] = index + 1
     self.data_index = {'validation': [], 'testing': [], 'training': []}
     unknown_index = {'validation': [], 'testing': [], 'training': []}
     all_words = {}
     # Look through all the subfolders to find audio samples
     search_path = os.path.join(self.data_dir, '*', '*.wav')
+    count = 1
+    wanted_count = 1
     for wav_path in gfile.Glob(search_path):
       _, word = os.path.split(os.path.dirname(wav_path))
       word = word.lower()
@@ -252,8 +270,12 @@ class AudioProcessor(object):
       # we'll use to train the unknown label.
       if word in wanted_words_index:
         self.data_index[set_index].append({'label': word, 'file': wav_path})
+        wanted_count += 1
       else:
         unknown_index[set_index].append({'label': word, 'file': wav_path})
+      count += 1
+    self.unknown_accept_rate = wanted_count * unknown_percentage / 100 /(count - wanted_count)
+    print('samples count: %d , wanted count: %d, accept rate: %.2f' % (count, wanted_count, self.unknown_accept_rate))
     if not all_words:
       raise Exception('No .wavs found at ' + search_path)
     for index, wanted_word in enumerate(wanted_words):
@@ -275,7 +297,7 @@ class AudioProcessor(object):
       # Pick some unknowns to add to each partition of the data set.
       random.shuffle(unknown_index[set_index])
       unknown_size = int(math.ceil(set_size * unknown_percentage / 100))
-      self.data_index[set_index].extend(unknown_index[set_index][:unknown_size])
+      self.data_index[set_index].extend(unknown_index[set_index][:])
     # Make sure the ordering is random.
     for set_index in ['validation', 'testing', 'training']:
       random.shuffle(self.data_index[set_index])
@@ -373,16 +395,41 @@ class AudioProcessor(object):
                                  self.background_volume_placeholder_)
     background_add = tf.add(background_mul, sliced_foreground)
     background_clamp = tf.clip_by_value(background_add, -1.0, 1.0)
+    ## Run the spectrogram and MFCC ops to get a 2D 'fingerprint' of the audio.
+    #spectrogram = contrib_audio.audio_spectrogram(
+    #    background_clamp,
+    #    window_size=model_settings['window_size_samples'],
+    #    stride=model_settings['window_stride_samples'],
+    #    magnitude_squared=True)
+    #self.mfcc_ = contrib_audio.mfcc(
+    #    spectrogram,
+    #    wav_decoder.sample_rate,
+    #    dct_coefficient_count=model_settings['dct_coefficient_count'])
     # Run the spectrogram and MFCC ops to get a 2D 'fingerprint' of the audio.
-    spectrogram = contrib_audio.audio_spectrogram(
-        background_clamp,
-        window_size=model_settings['window_size_samples'],
-        stride=model_settings['window_stride_samples'],
-        magnitude_squared=True)
-    self.mfcc_ = contrib_audio.mfcc(
-        spectrogram,
-        wav_decoder.sample_rate,
-        dct_coefficient_count=model_settings['dct_coefficient_count'])
+    background_clamp = tf.reshape(background_clamp, [1,-1])
+    self.background_clamp = background_clamp
+    stfts = tf.contrib.signal.stft(background_clamp, 
+                                   frame_length=model_settings['window_size_samples'],
+                                   frame_step=model_settings['window_stride_samples'],
+                                   fft_length=512,
+                                   window_fn=None)
+    spectrograms = tf.abs(stfts)
+    ## Warp the linear scale spectrograms into the mel-scale.
+    num_spectrogram_bins = stfts.shape[-1].value
+    lower_edge_hertz, upper_edge_hertz, num_mel_bins = 80.0, 3800.0, 26
+    linear_to_mel_weight_matrix = tf.contrib.signal.linear_to_mel_weight_matrix(num_mel_bins,num_spectrogram_bins, 16000, lower_edge_hertz,upper_edge_hertz)
+    self.linear_to_mel_weight_matrix = linear_to_mel_weight_matrix
+    self.spectrograms = spectrograms
+    self.num_spectrogram_bins = num_spectrogram_bins
+    mel_spectrograms = tf.tensordot(spectrograms, linear_to_mel_weight_matrix, 1)
+    mel_spectrograms.set_shape(spectrograms.shape[:-1].concatenate(linear_to_mel_weight_matrix.shape[-1:]))
+
+    ## Compute a stabilized log to get log-magnitude mel-scale spectrograms.
+    log_mel_spectrograms = tf.log(mel_spectrograms + 1e-6)
+
+    ## Compute MFCCs from log_mel_spectrograms and take the first 13.
+    self.mfcc_ = tf.contrib.signal.mfccs_from_log_mel_spectrograms(log_mel_spectrograms)[..., :model_settings['dct_coefficient_count']]
+    
 
   def set_size(self, mode):
     """Calculates the number of samples in the dataset partition.
@@ -434,13 +481,27 @@ class AudioProcessor(object):
     pick_deterministically = (mode != 'training')
     # Use the processing graph we created earlier to repeatedly to generate the
     # final output sample data we'll use in training.
+    unknown_count= 0
+    unknown_count_max = self.unknown_percentage/100*sample_count
     for i in xrange(offset, offset + sample_count):
       # Pick which audio sample to use.
       if how_many == -1 or pick_deterministically:
         sample_index = i
       else:
         sample_index = np.random.randint(len(candidates))
+        sample = candidates[sample_index]
+        while unknown_count > unknown_count_max and self.word_to_index[sample['label']] == UNKNOWN_WORD_INDEX:
+            sample_index = np.random.randint(len(candidates))
+            sample = candidates[sample_index]
+        #while self.word_to_index[sample['label']] == UNKNOWN_WORD_INDEX :
+        #    if np.random.randint(10000)/10000.0 > self.unknown_accept_rate:
+        #        sample_index = np.random.randint(len(candidates))
+        #        sample = candidates[sample_index]
+        #    else:
+        #        break
       sample = candidates[sample_index]
+      if self.word_to_index[sample['label']] == UNKNOWN_WORD_INDEX :
+          unknown_count += 1
       # If we're time shifting, set up the offset for this sample.
       if time_shift > 0:
         time_shift_amount = np.random.randint(-time_shift, time_shift)
@@ -481,9 +542,28 @@ class AudioProcessor(object):
       else:
         input_dict[self.foreground_volume_placeholder_] = 1
       # Run the graph to produce the output audio.
-      data[i - offset, :] = sess.run(self.mfcc_, feed_dict=input_dict).flatten()
+      pcm_d = sess.run([self.background_clamp], feed_dict=input_dict)
+      pcm_d = np.array(pcm_d)
+      #pcm_d = pcm_d * 32768
+      #pcm_d = pcm_d.astype(np.short)
+      #feat = sess.run(self.mfcc_, feed_dict=input_dict).flatten()
+      feat = mfcc_HTK(pcm_d.flatten(), samplerate=16000, numcep=13, winstep=0.09, winlen=0.03, highfreq=4000, lowfreq=80, nfft=512, nfilt=26, appendEnergy=False)
+      data[i - offset, :] = feat.flatten()
+      
+      #feat = mfcc_py(pcm_d.flatten(), samplerate=16000, numcep=13, winstep=0.09, winlen=0.03, highfreq=4000, nfft=512, nfilt=26, appendEnergy=False)
+      #feat = self.HTKmfcc.get_feats(pcm_d.flatten())
+      #data[i - offset, :] = feat.flatten()
+      #if self.word_to_index[sample['label']] > UNKNOWN_WORD_INDEX:
+      #  
+      #    name=sample['file'].split('.wav')[0]
+      #    name=name.split('/')[-1]
+      #    np.save(name+'mfcc', feat)
+      #    np.save(name+'pcm', pcm_d)
+      #    np.save(name+'stf', stfts)
+      #    print(name)
       label_index = self.word_to_index[sample['label']]
       labels[i - offset, label_index] = 1
+    print('unknown_count:', unknown_count, unknown_count_max)
     return data, labels
 
   def get_unprocessed_data(self, how_many, model_settings, mode):
