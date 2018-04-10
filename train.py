@@ -90,6 +90,26 @@ from tensorflow.contrib import slim as slim
 
 FLAGS = None
 
+def save_model_to_npy(sess, output_path):
+    if not os.path.exists(output_path):
+        os.makedirs(output_path)
+    output_path = os.path.join(output_path, 'model')
+    if not os.path.exists(output_path):
+        os.mkdir(output_path)
+
+    for var_obj in tf.global_variables():
+        name = var_obj.name
+        name = name.split(':')[0].split('/')
+        if len(name) >= 2:
+            file_name = name[-2]+name[-1]
+        else:
+            file_name = name[-1]
+        file_name = os.path.join(output_path, file_name)
+        var_arr = var_obj.eval(session=sess)
+        with open(file_name, 'wb') as f:
+            np.save(f, var_arr)
+        print(var_obj.name,file_name, var_arr.shape, var_arr.size, var_arr.dtype)
+
 
 def main(_):
   # We want to see all the logging messages for this tutorial.
@@ -195,6 +215,7 @@ def main(_):
 
   if FLAGS.start_checkpoint:
     models.load_variables_from_checkpoint(sess, FLAGS.start_checkpoint)
+    save_model_to_npy(sess, FLAGS.model_npy)
     start_step = global_step.eval(session=sess)
 
   tf.logging.info('Training from step: %d ', start_step)
@@ -234,7 +255,7 @@ def main(_):
             fingerprint_input: train_fingerprints,
             ground_truth_input: train_ground_truth,
             learning_rate_input: learning_rate_value,
-            dropout_prob: 1.0
+            dropout_prob: 0.7
         })
     train_writer.add_summary(train_summary, training_step)
     tf.logging.info('Step #%d: rate %f, accuracy %.2f%%, cross entropy %f' %
@@ -277,6 +298,7 @@ def main(_):
                                        FLAGS.model_architecture + '_'+ str(int(best_accuracy*10000)) + '.ckpt')
         tf.logging.info('Saving best model to "%s-%d"', checkpoint_path, training_step)
         saver.save(sess, checkpoint_path, global_step=training_step)
+        #save_model_to_npy(checkpoint_path, FLAGS.model_npy)
       tf.logging.info('So far the best validation accuracy is %.2f%%' % (best_accuracy*100))
 
   set_size = audio_processor.set_size('testing')
@@ -316,7 +338,7 @@ if __name__ == '__main__':
   parser.add_argument(
       '--data_dir',
       type=str,
-      default='/tmp/speech_dataset/',
+      default='/home/xysun/wakeup/google/',
       help="""\
       Where to download the speech training data to.
       """)
@@ -416,9 +438,14 @@ if __name__ == '__main__':
       default='/tmp/retrain_logs',
       help='Where to save summary logs for TensorBoard.')
   parser.add_argument(
+      '--model_npy',
+      type=str,
+      default='./model_npy',
+      help='Where to save summary logs for TensorBoard.')
+  parser.add_argument(
       '--wanted_words',
       type=str,
-      default='yes,no,up,down,left,right,on,off,stop,go',
+      default='yes,no,up,down',
       help='Words to use (others will be added to an unknown label)',)
   parser.add_argument(
       '--train_dir',
@@ -444,7 +471,7 @@ if __name__ == '__main__':
       '--model_size_info',
       type=int,
       nargs="+",
-      default=[128,128,128],
+      default=[64],
       help='Model dimensions - different for various models')
   parser.add_argument(
       '--check_nans',
