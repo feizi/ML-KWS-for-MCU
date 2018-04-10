@@ -1,0 +1,3 @@
+[submodule "python_speech_features"]
+	path = python_speech_features
+	url = ./python_speech_features.git
